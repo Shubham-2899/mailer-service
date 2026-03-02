@@ -57,6 +57,8 @@ npm start
 
 ### Using Docker Compose (Recommended)
 
+The default configuration uses `network_mode: "host"` to allow the container to access the host's SMTP server (Exim4).
+
 1. Make sure you have `.env` file configured:
 ```bash
 cp .env.example .env
@@ -82,6 +84,8 @@ docker-compose down
 ```bash
 docker-compose up -d --build
 ```
+
+**Note**: If you're using Exim4 or any SMTP server on the host machine, the host network mode is required for the container to connect to `localhost:587`.
 
 ### Using Docker Directly
 
@@ -273,3 +277,71 @@ Get queue status (requires authentication).
 - Health check: `GET /mail/health`
 - Queue status: `GET /mail/queue`
 - Logs: Check console output for campaign progress
+
+## Troubleshooting
+
+### SMTP Connection Issues in Docker
+
+If you see `ECONNREFUSED 127.0.1.1:587` errors when running in Docker:
+
+**Problem**: Docker container cannot connect to SMTP server on host machine (e.g., Exim4 via Hestia panel).
+
+**Solution 1: Use Host Network Mode (Recommended)**
+
+The default `docker-compose.yml` uses `network_mode: "host"` which allows the container to access the host's SMTP server directly.
+
+```bash
+docker-compose down
+docker-compose up -d
+```
+
+**Solution 2: Configure SMTP to Listen on External IP**
+
+If you need bridge network mode:
+
+1. Configure your SMTP server (Exim4) to listen on the host's external IP or `0.0.0.0`
+2. Update SMTP host in requests to use the host's external IP instead of `mail.domain.com`
+3. Use the alternative compose file:
+```bash
+docker-compose -f docker-compose.bridge.yml up -d
+```
+
+**Solution 3: Use Host IP in SMTP Config**
+
+When calling the mailer service, use the actual host IP instead of domain:
+
+```json
+{
+  "smtpConfig": {
+    "host": "192.168.1.100",  // Use actual host IP
+    "user": "admin@domain.com",
+    "port": 587
+  }
+}
+```
+
+### Verify SMTP Connectivity
+
+From inside the container:
+```bash
+docker exec -it mms-mailer-service sh
+nc -zv localhost 587
+# or
+telnet localhost 587
+```
+
+From host machine:
+```bash
+nc -zv localhost 587
+telnet localhost 587
+```
+
+### Check Exim4 Configuration
+
+Ensure Exim4 is listening on the correct interface:
+```bash
+netstat -tlnp | grep 587
+# Should show: 0.0.0.0:587 or your-ip:587
+```
+
+If it only shows `127.0.0.1:587`, you need to configure Exim4 to listen on all interfaces or use host network mode in Docker.

@@ -122,6 +122,8 @@ interface TestEmailRequest {
 
 // POST /mail/test - Send test emails
 router.post('/test', authenticateMailerRequest, async (req: Request, res: Response) => {
+  console.log('[/mail/test] Request received');
+  
   try {
     const body: TestEmailRequest = req.body;
 
@@ -139,6 +141,7 @@ router.post('/test', authenticateMailerRequest, async (req: Request, res: Respon
 
     for (const field of requiredFields) {
       if (!body[field as keyof TestEmailRequest]) {
+        console.log('[/mail/test] Missing required field:', field);
         return res.status(400).json({
           success: false,
           message: `Missing required field: ${field}`,
@@ -147,6 +150,7 @@ router.post('/test', authenticateMailerRequest, async (req: Request, res: Respon
     }
 
     if (!Array.isArray(body.to) || body.to.length === 0) {
+      console.log('[/mail/test] No recipients provided');
       return res.status(400).json({
         success: false,
         message: 'No recipients found, Please add recipients',
@@ -161,6 +165,7 @@ router.post('/test', authenticateMailerRequest, async (req: Request, res: Respon
     };
 
     if (!smtpConfig.host || !smtpConfig.user) {
+      console.log('[/mail/test] SMTP configuration missing');
       return res.status(400).json({
         success: false,
         message: 'SMTP configuration is required (either in request body or environment variables)',
@@ -168,6 +173,9 @@ router.post('/test', authenticateMailerRequest, async (req: Request, res: Respon
     }
 
     const { from, fromName, subject, emailTemplate, offerId, campaignId, to, selectedIp } = body;
+
+    console.log('[/mail/test] Starting to send emails to', to.length, 'recipients');
+    console.log('[/mail/test] SMTP Config:', { host: smtpConfig.host, user: smtpConfig.user, port: smtpConfig.port });
 
     const decodedTemplate = decodeURIComponent(emailTemplate);
     const ip = selectedIp?.split('-')[1]?.trim();
@@ -207,6 +215,8 @@ router.post('/test', authenticateMailerRequest, async (req: Request, res: Respon
 
         sent.push(email);
       } catch (err: any) {
+        console.error('[/mail/test] Failed to send email to:', email, 'Error:', err.message);
+        
         // Save to emails collection for reports
         await EmailModel.create({
           from,
@@ -224,6 +234,8 @@ router.post('/test', authenticateMailerRequest, async (req: Request, res: Respon
       }
     }
 
+    console.log('[/mail/test] Completed. Sent:', sent.length, 'Failed:', failed.length);
+
     res.json({
       message:
         failed.length > 0
@@ -236,7 +248,7 @@ router.post('/test', authenticateMailerRequest, async (req: Request, res: Respon
       emailFailed: failed.length,
     });
   } catch (error: any) {
-    console.error('Error sending test emails:', error);
+    console.error('[/mail/test] Error sending test emails:', error);
     res.status(500).json({
       success: false,
       message: 'Internal server error',
