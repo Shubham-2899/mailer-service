@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import mailRoutes from './routes/mail.routes';
+import trackingRoutes from './routes/tracking.routes';
 import { connectDatabase } from './config/database.config';
 
 // Load environment variables
@@ -17,6 +18,7 @@ app.use(express.urlencoded({ extended: true }));
 
 // Routes
 app.use('/mail', mailRoutes);
+app.use('/tracking', trackingRoutes);
 
 // Root endpoint
 app.get('/', (req, res) => {

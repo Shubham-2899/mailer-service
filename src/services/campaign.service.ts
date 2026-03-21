@@ -1,7 +1,9 @@
-import { CampaignModel, ICampaign } from '../models/campaign.model';
+import { CampaignModel } from '../models/campaign.model';
 import { CampaignEmailTrackingModel } from '../models/tracking.model';
 import { EmailModel } from '../models/email.model';
+import { LiveSendingModel } from '../models/live-sending.model';
 import { createTransporter, SmtpConfig } from './mailer.util';
+import * as nodemailer from 'nodemailer';
 
 export interface CampaignOptions {
   campaignId: string;
@@ -14,6 +16,11 @@ export interface CampaignOptions {
   emailTemplate: string;
   offerId: string;
   selectedIp: string;
+  /**
+   * All IPs for round-robin sending: ["domain - mainIp", "domain - subIp1", ...]
+   * When provided with more than one entry, each email is sent from the next IP in sequence.
+   */
+  allIps?: string[];
 }
 
 export class CampaignService {
@@ -22,7 +29,6 @@ export class CampaignService {
   async startCampaign(options: CampaignOptions): Promise<{ success: boolean; message: string }> {
     const { campaignId } = options;
 
-    // Check if campaign is already running
     if (this.runningCampaigns.has(campaignId)) {
       return {
         success: true,
@@ -30,7 +36,6 @@ export class CampaignService {
       };
     }
 
-    // Start background loop (fire-and-forget)
     const promise = this.runCampaignInBackground(options)
       .catch((err) => {
         console.error(`❌ Error in campaign loop for ${campaignId}:`, err);
@@ -51,6 +56,22 @@ export class CampaignService {
     return Array.from(this.runningCampaigns.keys());
   }
 
+  private buildTransporters(
+    allIps: string[],
+    smtpConfig: SmtpConfig,
+  ): Array<{ ip: string; domain: string; transporter: nodemailer.Transporter }> {
+    return allIps.map((entry) => {
+      const domain = entry.split('-')[0]?.trim();
+      const ip = entry.split('-')[1]?.trim();
+      const hostConfig: SmtpConfig = {
+        host: `mail.${domain}`,
+        user: `admin@${domain}`,
+        port: smtpConfig.port || 587,
+      };
+      return { ip, domain, transporter: createTransporter(hostConfig) };
+    });
+  }
+
   private async runCampaignInBackground(options: CampaignOptions): Promise<void> {
     const {
       campaignId,
@@ -63,28 +84,36 @@ export class CampaignService {
       emailTemplate,
       offerId,
       selectedIp,
+      allIps,
     } = options;
 
     console.log(`🚀 Starting campaign loop for ${campaignId}`);
 
-    const transporter = createTransporter(smtpConfig);
     const decodedTemplate = decodeURIComponent(emailTemplate);
-    const ip = selectedIp?.split('-')[1]?.trim();
-    const domain = selectedIp?.split('-')[0]?.trim();
-    const headers = { 'X-Outgoing-IP': ip };
     const delayBetweenEmailsMs = 100;
 
+    // Build transporter pool — one per IP for round-robin
+    const ipPool = this.buildTransporters(
+      allIps && allIps.length > 0 ? allIps : [selectedIp],
+      smtpConfig,
+    );
+    const isRoundRobin = ipPool.length > 1;
+
+    console.log(
+      `📡 IP pool for campaign ${campaignId}: [${ipPool.map((p) => p.ip).join(', ')}]${isRoundRobin ? ' (round-robin)' : ''}`,
+    );
+
+    // Track global email index for round-robin rotation
+    let globalEmailIndex = 0;
     let campaignCompleted = false;
 
     while (true) {
-      // Check campaign status before processing
       const campaign = await CampaignModel.findOne({ campaignId }).lean();
       if (!campaign || campaign.status !== 'running') {
         console.log(`⏹️ Campaign ${campaignId} is not running, stopping processor.`);
         break;
       }
 
-      // Get pending emails for this campaign
       const recipients = await CampaignEmailTrackingModel.find({
         campaignId,
         status: 'pending',
@@ -101,31 +130,31 @@ export class CampaignService {
 
       console.log(`📧 Processing ${recipients.length} emails for campaign ${campaignId}`);
 
-      // Prepare bulk operations for better performance
       const emailRecords: any[] = [];
       const trackingUpdates: any[] = [];
+      const liveSendingRecords: any[] = [];
       let count = 0;
 
       for (const recipient of recipients) {
-        // Hybrid pause check - check status every 3 emails
         if (count % 3 === 0) {
           const statusCheck = await CampaignModel.findOne({ campaignId }).lean();
           if (!statusCheck || statusCheck.status !== 'running') {
-            console.log(
-              '⏹️ Paused mid-batch (hybrid check), flushing partial results and stopping early.'
-            );
-
-            // Flush partial batch results
+            console.log('⏹️ Paused mid-batch, flushing partial results and stopping early.');
             if (emailRecords.length > 0) {
               await Promise.all([
                 EmailModel.insertMany(emailRecords),
                 CampaignEmailTrackingModel.bulkWrite(trackingUpdates),
+                LiveSendingModel.insertMany(liveSendingRecords),
               ]);
             }
-
             return;
           }
         }
+
+        // Round-robin: pick IP by global index
+        const poolEntry = ipPool[globalEmailIndex % ipPool.length];
+        const { ip, domain, transporter } = poolEntry;
+        const headers = { 'X-Outgoing-IP': ip };
 
         try {
           const info = await transporter.sendMail({
@@ -140,7 +169,6 @@ export class CampaignService {
             },
           });
 
-          // Prepare email record for bulk insert
           emailRecords.push({
             from,
             to: recipient.to_email,
@@ -153,23 +181,24 @@ export class CampaignService {
             ipUsed: ip,
           });
 
-          // Prepare tracking update for bulk operation
           trackingUpdates.push({
             updateOne: {
               filter: { _id: recipient._id },
-              update: {
-                $set: {
-                  status: 'sent',
-                  sentAt: new Date(),
-                  isProcessed: true,
-                },
-              },
+              update: { $set: { status: 'sent', sentAt: new Date(), isProcessed: true } },
             },
           });
 
-          console.log(`✅ Sent to ${recipient.to_email}`);
+          liveSendingRecords.push({
+            campaignId,
+            to: recipient.to_email,
+            ipUsed: ip,
+            domain,
+            status: 'sent',
+            sentAt: new Date(),
+          });
+
+          console.log(`✅ [${ip}] Sent to ${recipient.to_email}`);
         } catch (err: any) {
-          // Prepare email record for bulk insert (failed)
           emailRecords.push({
             from,
             to: recipient.to_email,
@@ -182,7 +211,6 @@ export class CampaignService {
             ipUsed: ip,
           });
 
-          // Prepare tracking update for bulk operation (failed)
           trackingUpdates.push({
             updateOne: {
               filter: { _id: recipient._id },
@@ -197,82 +225,59 @@ export class CampaignService {
             },
           });
 
-          console.warn(`❌ Failed to send to ${recipient.to_email}: ${err.message}`);
+          liveSendingRecords.push({
+            campaignId,
+            to: recipient.to_email,
+            ipUsed: ip,
+            domain,
+            status: 'failed',
+            errorMessage: err.message,
+            sentAt: new Date(),
+          });
+
+          console.warn(`❌ [${ip}] Failed to send to ${recipient.to_email}: ${err.message}`);
         }
 
         count++;
-        // Small delay between individual emails to prevent rate limiting
+        globalEmailIndex++;
         await new Promise((res) => setTimeout(res, delayBetweenEmailsMs));
       }
 
-      // Bulk operations - only 2 queries instead of 5 per email
       const operations: Promise<any>[] = [];
-
-      if (emailRecords.length > 0) {
-        operations.push(EmailModel.insertMany(emailRecords));
-      }
-
-      if (trackingUpdates.length > 0) {
-        operations.push(CampaignEmailTrackingModel.bulkWrite(trackingUpdates));
-      }
-
-      if (operations.length > 0) {
-        await Promise.all(operations);
-      }
+      if (emailRecords.length > 0) operations.push(EmailModel.insertMany(emailRecords));
+      if (trackingUpdates.length > 0) operations.push(CampaignEmailTrackingModel.bulkWrite(trackingUpdates));
+      if (liveSendingRecords.length > 0) operations.push(LiveSendingModel.insertMany(liveSendingRecords));
+      if (operations.length > 0) await Promise.all(operations);
 
       console.log(`⏳ Waiting ${delay} seconds before next batch...`);
       await new Promise((res) => setTimeout(res, delay * 1000));
     }
 
-    // Only mark as completed if campaign actually finished all emails
     if (campaignCompleted) {
-      // Mark campaign as completed
       await CampaignModel.updateOne(
         { campaignId },
-        {
-          status: 'completed',
-          completedAt: new Date(),
-          pendingEmails: 0,
-        }
+        { status: 'completed', completedAt: new Date(), pendingEmails: 0 },
       );
-
-      // Clean up campaign tracking data after completion
       await this.cleanupCampaignData(campaignId);
-
-      console.log(`✅ Campaign ${campaignId} email sending completed.`);
+      console.log(`✅ Campaign ${campaignId} completed.`);
     } else {
-      console.log(`⏸️ Campaign ${campaignId} was paused, not marking as completed.`);
+      console.log(`⏸️ Campaign ${campaignId} was paused.`);
     }
   }
 
   private async cleanupCampaignData(campaignId: string): Promise<void> {
     try {
-      // Persist stats in the campaign document
       const [sent, failed, pending] = await Promise.all([
         CampaignEmailTrackingModel.countDocuments({ campaignId, status: 'sent' }),
-        CampaignEmailTrackingModel.countDocuments({
-          campaignId,
-          status: 'failed',
-        }),
-        CampaignEmailTrackingModel.countDocuments({
-          campaignId,
-          status: 'pending',
-        }),
+        CampaignEmailTrackingModel.countDocuments({ campaignId, status: 'failed' }),
+        CampaignEmailTrackingModel.countDocuments({ campaignId, status: 'pending' }),
       ]);
-      const total = sent + failed + pending;
 
-      // Persist stats in the campaign document
       await CampaignModel.updateOne(
         { campaignId },
-        {
-          sentEmails: sent,
-          failedEmails: failed,
-          totalEmails: total,
-          pendingEmails: pending,
-        }
+        { sentEmails: sent, failedEmails: failed, totalEmails: sent + failed + pending, pendingEmails: pending },
       );
 
-      // Delete tracking data for sent/failed emails (keep pending for potential reactivation)
       await CampaignEmailTrackingModel.deleteMany({
         campaignId,
         status: { $in: ['sent', 'failed'] },

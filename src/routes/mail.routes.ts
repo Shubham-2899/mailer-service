@@ -18,6 +18,8 @@ interface StartCampaignRequest {
   emailTemplate: string;
   offerId: string;
   selectedIp: string;
+  /** Round-robin IP list: ["domain - mainIp", "domain - subIp1", ...] */
+  allIps?: string[];
 }
 
 // POST /mail/campaign/start - Start or resume a campaign
@@ -72,6 +74,7 @@ router.post('/campaign/start', authenticateMailerRequest, async (req: Request, r
       emailTemplate: body.emailTemplate,
       offerId: body.offerId,
       selectedIp: body.selectedIp,
+      allIps: body.allIps,
     };
 
     const result = await campaignService.startCampaign(options);
