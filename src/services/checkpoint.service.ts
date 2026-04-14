@@ -116,6 +116,7 @@ export class CheckpointService {
 
       // Check INBOX first
       const inboxResult = await this.searchFolder(client, 'INBOX', subject, sentAfter);
+      console.log("🚀 ~ CheckpointService ~ pollAccount ~ inboxResult:", inboxResult)
       if (inboxResult) {
         await client.logout();
         return 'inbox';
@@ -123,6 +124,7 @@ export class CheckpointService {
 
       // Check Bulk Mail (Yahoo's spam folder)
       const spamResult = await this.searchFolder(client, 'Bulk Mail', subject, sentAfter);
+      console.log("🚀 ~ CheckpointService ~ pollAccount ~ spamResult:", spamResult)
       if (spamResult) {
         await client.logout();
         return 'spam';

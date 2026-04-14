@@ -260,4 +260,65 @@ router.post('/test', authenticateMailerRequest, async (req: Request, res: Respon
   }
 });
 
+// POST /mail/checkpoint/test — manually trigger a deliverability checkpoint
+// Sends the provided email to all active test accounts, waits, polls IMAP, returns result.
+// Use this to verify test accounts and IMAP credentials before relying on the automated flow.
+router.post('/checkpoint/test', authenticateMailerRequest, async (req: Request, res: Response) => {
+  try {
+    const { from, fromName, subject, emailTemplate, offerId, selectedIp, smtpConfig: bodySmtp } = req.body;
+
+    const requiredFields = ['from', 'fromName', 'subject', 'emailTemplate', 'offerId', 'selectedIp'];
+    for (const field of requiredFields) {
+      if (!req.body[field]) {
+        return res.status(400).json({ success: false, message: `Missing required field: ${field}` });
+      }
+    }
+
+    const smtpConfig: SmtpConfig = bodySmtp || {
+      host: process.env.SMTP_HOST || '',
+      user: process.env.SMTP_USER || '',
+      port: parseInt(process.env.SMTP_PORT || '587', 10),
+    };
+
+    if (!smtpConfig.host || !smtpConfig.user) {
+      return res.status(400).json({ success: false, message: 'SMTP configuration is required' });
+    }
+
+    const ip = selectedIp?.split('-')[1]?.trim();
+    const domain = selectedIp?.split('-')[0]?.trim();
+
+    if (!ip || !domain) {
+      return res.status(400).json({ success: false, message: 'Invalid selectedIp format. Expected "domain - ip"' });
+    }
+
+    const { CheckpointService } = await import('../services/checkpoint.service');
+    const checkpointService = new CheckpointService();
+    const transporter = createTransporter(smtpConfig);
+
+    const result = await checkpointService.runCheckpoint({
+      campaignId: 'manual-test',
+      from,
+      fromName,
+      subject,
+      decodedTemplate: decodeURIComponent(emailTemplate),
+      offerId,
+      smtpConfig,
+      currentIp: ip,
+      currentDomain: domain,
+      currentTransporter: transporter,
+    });
+
+    res.json({
+      success: true,
+      result,                          // 'inbox' | 'spam'
+      message: result === 'inbox'
+        ? 'All test accounts received in inbox.'
+        : 'Spam detected — one or more test accounts received in Bulk Mail / not found.',
+    });
+  } catch (error: any) {
+    console.error('[/mail/checkpoint/test] Error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error', error: error.message });
+  }
+});
+
 export default router;
