@@ -114,6 +114,7 @@ export class CampaignService {
     const defaultInterval = parseInt(process.env.CHECKPOINT_INTERVAL || '500', 10);
     const checkpointInterval = campaignDoc?.checkpointInterval ?? defaultInterval;
     let emailsSinceLastCheck: number = campaignDoc?.emailsSinceLastCheck ?? 0;
+    const checkpointEnabled = process.env.DELIVERABILITY_CHECK_ENABLED === 'true';
 
     while (true) {
       const campaign = await CampaignModel.findOne({ campaignId }).lean(); 
@@ -258,37 +259,39 @@ export class CampaignService {
       if (operations.length > 0) await Promise.all(operations);
 
       // ── Deliverability checkpoint ──────────────────────────────────────────
-      emailsSinceLastCheck += recipients.length;
-      // Persist counter so a manual pause/resume picks up from the right place
-      await CampaignModel.updateOne({ campaignId }, { emailsSinceLastCheck });
+      if (checkpointEnabled) {
+        emailsSinceLastCheck += recipients.length;
+        // Persist counter so a manual pause/resume picks up from the right place
+        await CampaignModel.updateOne({ campaignId }, { emailsSinceLastCheck });
 
-      if (emailsSinceLastCheck >= checkpointInterval) {
-        const poolEntry = ipPool[globalEmailIndex % ipPool.length];
-        const checkpointResult = await this.checkpointService.runCheckpoint({
-          campaignId,
-          from,
-          fromName,
-          subject,
-          decodedTemplate,
-          offerId,
-          smtpConfig,
-          currentIp: poolEntry.ip,
-          currentDomain: poolEntry.domain,
-          currentTransporter: poolEntry.transporter,
-        });
-
-        if (checkpointResult === 'inbox') {
-          await CampaignModel.updateOne({ campaignId }, { checkpointStatus: 'inbox', emailsSinceLastCheck: 0 });
-          emailsSinceLastCheck = 0;
-          console.log(`✅ [Checkpoint] Inbox confirmed — resuming campaign ${campaignId}`);
-        } else {
-          await CampaignModel.updateOne({ campaignId }, {
-            checkpointStatus: 'spam',
-            status: 'paused',
-            emailsSinceLastCheck: 0,
+        if (emailsSinceLastCheck >= checkpointInterval) {
+          const poolEntry = ipPool[globalEmailIndex % ipPool.length];
+          const checkpointResult = await this.checkpointService.runCheckpoint({
+            campaignId,
+            from,
+            fromName,
+            subject,
+            decodedTemplate,
+            offerId,
+            smtpConfig,
+            currentIp: poolEntry.ip,
+            currentDomain: poolEntry.domain,
+            currentTransporter: poolEntry.transporter,
           });
-          console.warn(`🚨 [Checkpoint] Spam detected — campaign ${campaignId} paused`);
-          return; // exit loop, campaign stays paused
+
+          if (checkpointResult === 'inbox') {
+            await CampaignModel.updateOne({ campaignId }, { checkpointStatus: 'inbox', emailsSinceLastCheck: 0 });
+            emailsSinceLastCheck = 0;
+            console.log(`✅ [Checkpoint] Inbox confirmed — resuming campaign ${campaignId}`);
+          } else {
+            await CampaignModel.updateOne({ campaignId }, {
+              checkpointStatus: 'spam',
+              status: 'paused',
+              emailsSinceLastCheck: 0,
+            });
+            console.warn(`🚨 [Checkpoint] Spam detected — campaign ${campaignId} paused`);
+            return; // exit loop, campaign stays paused
+          }
         }
       }
       // ──────────────────────────────────────────────────────────────────────
