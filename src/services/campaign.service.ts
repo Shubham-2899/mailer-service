@@ -3,6 +3,7 @@ import { CampaignEmailTrackingModel } from '../models/tracking.model';
 import { EmailModel } from '../models/email.model';
 import { LiveSendingModel } from '../models/live-sending.model';
 import { createTransporter, SmtpConfig } from './mailer.util';
+import { CheckpointService } from './checkpoint.service';
 import * as nodemailer from 'nodemailer';
 
 export interface CampaignOptions {
@@ -25,6 +26,7 @@ export interface CampaignOptions {
 
 export class CampaignService {
   private runningCampaigns = new Map<string, Promise<void>>();
+  private checkpointService = new CheckpointService();
 
   async startCampaign(options: CampaignOptions): Promise<{ success: boolean; message: string }> {
     const { campaignId } = options;
@@ -107,9 +109,16 @@ export class CampaignService {
     let globalEmailIndex = 0;
     let campaignCompleted = false;
 
+    // Load checkpoint counter from DB so resume continues from correct count
+    const campaignDoc = await CampaignModel.findOne({ campaignId }).lean();
+    const defaultInterval = parseInt(process.env.CHECKPOINT_INTERVAL || '500', 10);
+    const checkpointInterval = campaignDoc?.checkpointInterval ?? defaultInterval;
+    let emailsSinceLastCheck: number = campaignDoc?.emailsSinceLastCheck ?? 0;
+    const checkpointEnabled = process.env.DELIVERABILITY_CHECK_ENABLED === 'true';
+
     while (true) {
-      const campaign = await CampaignModel.findOne({ campaignId }).lean();
-      if (!campaign || campaign.status !== 'running') {
+      const campaign = await CampaignModel.findOne({ campaignId }).lean(); 
+           if (!campaign || campaign.status !== 'running') {
         console.log(`⏹️ Campaign ${campaignId} is not running, stopping processor.`);
         break;
       }
@@ -248,6 +257,44 @@ export class CampaignService {
       if (trackingUpdates.length > 0) operations.push(CampaignEmailTrackingModel.bulkWrite(trackingUpdates));
       if (liveSendingRecords.length > 0) operations.push(LiveSendingModel.insertMany(liveSendingRecords));
       if (operations.length > 0) await Promise.all(operations);
+
+      // ── Deliverability checkpoint ──────────────────────────────────────────
+      if (checkpointEnabled) {
+        emailsSinceLastCheck += recipients.length;
+        // Persist counter so a manual pause/resume picks up from the right place
+        await CampaignModel.updateOne({ campaignId }, { emailsSinceLastCheck });
+
+        if (emailsSinceLastCheck >= checkpointInterval) {
+          const poolEntry = ipPool[globalEmailIndex % ipPool.length];
+          const checkpointResult = await this.checkpointService.runCheckpoint({
+            campaignId,
+            from,
+            fromName,
+            subject,
+            decodedTemplate,
+            offerId,
+            smtpConfig,
+            currentIp: poolEntry.ip,
+            currentDomain: poolEntry.domain,
+            currentTransporter: poolEntry.transporter,
+          });
+
+          if (checkpointResult === 'inbox') {
+            await CampaignModel.updateOne({ campaignId }, { checkpointStatus: 'inbox', emailsSinceLastCheck: 0 });
+            emailsSinceLastCheck = 0;
+            console.log(`✅ [Checkpoint] Inbox confirmed — resuming campaign ${campaignId}`);
+          } else {
+            await CampaignModel.updateOne({ campaignId }, {
+              checkpointStatus: 'spam',
+              status: 'paused',
+              emailsSinceLastCheck: 0,
+            });
+            console.warn(`🚨 [Checkpoint] Spam detected — campaign ${campaignId} paused`);
+            return; // exit loop, campaign stays paused
+          }
+        }
+      }
+      // ──────────────────────────────────────────────────────────────────────
 
       console.log(`⏳ Waiting ${delay} seconds before next batch...`);
       await new Promise((res) => setTimeout(res, delay * 1000));

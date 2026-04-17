@@ -19,6 +19,9 @@ export interface ICampaign extends Document {
   totalEmails?: number;
   sentEmails?: number;
   failedEmails?: number;
+  checkpointStatus?: string;
+  emailsSinceLastCheck?: number;
+  checkpointInterval?: number;
   createdAt?: Date;
   updatedAt?: Date;
 }
@@ -47,6 +50,9 @@ const CampaignSchema = new Schema<ICampaign>(
     totalEmails: Number,
     sentEmails: Number,
     failedEmails: Number,
+    checkpointStatus: { type: String, enum: ['idle', 'checking', 'inbox', 'spam'], default: 'idle' },
+    emailsSinceLastCheck: { type: Number, default: 0 },
+    checkpointInterval: Number,
   },
   { collection: 'campaigns', timestamps: true }
 );
